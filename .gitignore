@@ -12,7 +12,8 @@ dist/
 *.out
 coverage/
 coverage.*
-gateway/cmd/server/main
+/gateway/cmd/*/main
+/gateway/cmd/server/server
 
 # Python and tool caches
 .venv/
