@@ -1,27 +1,19 @@
 package main
 
 import (
-	"fmt"
+	"log"
 	"net/http"
+
+	"github.com/Verlias/distributed-gpu-inference-orchestrator/internal/handlers"
 )
 
-func hello(w http.ResponseWriter, req *http.Request) {
-	
-	fmt.Fprintf(w, "Hello\n")
-}
-
-func header(w http.ResponseWriter, req *http.Request) {
-	
-	fmt.Fprintf(w, "Header\n")
-	
-}
-
-
-
 func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", handlers.Health)
+	mux.HandleFunc("/inference", handlers.Inference)
 
-	http.HandleFunc("/hello", hello)
-	http.HandleFunc("/headers", header)
-
-	http.ListenAndServe(":8090", nil)
+	log.Println("API gateway listening on :8090")
+	if err := http.ListenAndServe(":8090", mux); err != nil {
+		log.Fatalf("server stopped: %v", err)
+	}
 }
