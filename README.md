@@ -16,3 +16,8 @@ the gateway's other API models in `gateway/internal/models`.
 
 See [`inference-server/README.md`](inference-server/README.md) for setup and API
 examples.
+
+
+## System Architecture
+
+![GPU Inference Orchestrator Architecture](docs/architecture.svg)
