@@ -1,0 +1,30 @@
+services:
+  registry:
+    build:
+      context: .
+    ports:
+      - "8081:8081"
+    environment:
+      REGISTRY_LISTEN_ADDR: ":8081"
+      REDIS_ADDR: "redis:6379"
+      REDIS_KEY_PREFIX: "gpu-orchestrator"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    container_name: gpu-orchestrator-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  redis-data:
