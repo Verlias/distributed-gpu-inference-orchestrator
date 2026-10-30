@@ -14,6 +14,7 @@ coverage/
 coverage.*
 /gateway/cmd/*/main
 /gateway/cmd/server/server
+/registry/server
 
 # Python and tool caches
 .venv/
