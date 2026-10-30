@@ -63,16 +63,19 @@ func (s *RedisStore) Ping(ctx context.Context) error {
 	return err
 }
 
-func (s *RedisStore) Create(ctx context.Context, worker models.Worker) (models.Worker, error) {
+func (s *RedisStore) Create(ctx context.Context, worker models.Worker, leaseTTL time.Duration) (models.Worker, error) {
 	const script = `
 if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
 redis.call('HSET', KEYS[1],
   'worker_id', ARGV[1], 'endpoint', ARGV[2], 'health_status', ARGV[3],
-  'last_heartbeat', '', 'waiting_requests', '0', 'kv_cache_utilization', '0')
-redis.call('SADD', KEYS[2], ARGV[1])
+  'last_heartbeat', '', 'lease_expires_at', ARGV[4],
+  'waiting_requests', '0', 'kv_cache_utilization', '0')
+redis.call('PEXPIRE', KEYS[1], ARGV[5])
+redis.call('ZADD', KEYS[2], ARGV[6], ARGV[1])
 return 1`
-	result, err := s.client.do(ctx, "EVAL", script, "2", s.workerKey(worker.ID), s.indexKey(),
-		worker.ID, worker.Endpoint, string(worker.HealthStatus))
+	result, err := s.client.do(ctx, "EVAL", script, "2", s.workerKey(worker.ID), s.leaseKey(),
+		worker.ID, worker.Endpoint, string(worker.HealthStatus), worker.LeaseExpiresAt.Format(time.RFC3339Nano),
+		strconv.FormatInt(leaseTTL.Milliseconds(), 10), strconv.FormatInt(worker.LeaseExpiresAt.UnixMilli(), 10))
 	if err != nil {
 		return models.Worker{}, fmt.Errorf("create worker in Redis: %w", err)
 	}
@@ -86,17 +89,22 @@ return 1`
 	return s.Get(ctx, worker.ID)
 }
 
-func (s *RedisStore) UpsertIdentity(ctx context.Context, input models.WorkerRegistration) (models.Worker, error) {
+func (s *RedisStore) UpsertIdentity(
+	ctx context.Context, input models.WorkerRegistration, leaseExpiresAt time.Time, leaseTTL time.Duration,
+) (models.Worker, error) {
 	const script = `
 redis.call('HSET', KEYS[1], 'worker_id', ARGV[1], 'endpoint', ARGV[2])
 redis.call('HSETNX', KEYS[1], 'health_status', ARGV[3])
 redis.call('HSETNX', KEYS[1], 'last_heartbeat', '')
 redis.call('HSETNX', KEYS[1], 'waiting_requests', '0')
 redis.call('HSETNX', KEYS[1], 'kv_cache_utilization', '0')
-redis.call('SADD', KEYS[2], ARGV[1])
+redis.call('HSET', KEYS[1], 'lease_expires_at', ARGV[4])
+redis.call('PEXPIRE', KEYS[1], ARGV[5])
+redis.call('ZADD', KEYS[2], ARGV[6], ARGV[1])
 return 1`
-	_, err := s.client.do(ctx, "EVAL", script, "2", s.workerKey(input.ID), s.indexKey(),
-		input.ID, input.Endpoint, string(models.HealthStatusUnknown))
+	_, err := s.client.do(ctx, "EVAL", script, "2", s.workerKey(input.ID), s.leaseKey(),
+		input.ID, input.Endpoint, string(models.HealthStatusUnknown), leaseExpiresAt.Format(time.RFC3339Nano),
+		strconv.FormatInt(leaseTTL.Milliseconds(), 10), strconv.FormatInt(leaseExpiresAt.UnixMilli(), 10))
 	if err != nil {
 		return models.Worker{}, fmt.Errorf("upsert worker in Redis: %w", err)
 	}
@@ -104,17 +112,22 @@ return 1`
 }
 
 func (s *RedisStore) UpdateHeartbeat(
-	ctx context.Context, id string, heartbeat models.Heartbeat, receivedAt time.Time,
+	ctx context.Context, id string, heartbeat models.Heartbeat, receivedAt, leaseExpiresAt time.Time, leaseTTL time.Duration,
 ) (models.Worker, error) {
 	const script = `
 if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
 redis.call('HSET', KEYS[1],
   'health_status', ARGV[1], 'last_heartbeat', ARGV[2],
-  'waiting_requests', ARGV[3], 'kv_cache_utilization', ARGV[4])
+  'waiting_requests', ARGV[3], 'kv_cache_utilization', ARGV[4],
+  'lease_expires_at', ARGV[5])
+redis.call('PEXPIRE', KEYS[1], ARGV[6])
+redis.call('ZADD', KEYS[2], ARGV[7], ARGV[8])
 return 1`
-	result, err := s.client.do(ctx, "EVAL", script, "1", s.workerKey(id),
+	result, err := s.client.do(ctx, "EVAL", script, "2", s.workerKey(id), s.leaseKey(),
 		string(heartbeat.HealthStatus), receivedAt.UTC().Format(time.RFC3339Nano),
-		strconv.Itoa(heartbeat.WaitingRequests), strconv.FormatFloat(heartbeat.KVCacheUtilization, 'g', -1, 64))
+		strconv.Itoa(heartbeat.WaitingRequests), strconv.FormatFloat(heartbeat.KVCacheUtilization, 'g', -1, 64),
+		leaseExpiresAt.Format(time.RFC3339Nano), strconv.FormatInt(leaseTTL.Milliseconds(), 10),
+		strconv.FormatInt(leaseExpiresAt.UnixMilli(), 10), id)
 	if err != nil {
 		return models.Worker{}, fmt.Errorf("update worker heartbeat in Redis: %w", err)
 	}
@@ -143,8 +156,9 @@ func (s *RedisStore) Get(ctx context.Context, id string) (models.Worker, error) 
 	return decodeWorker(fields)
 }
 
-func (s *RedisStore) List(ctx context.Context) ([]models.Worker, error) {
-	result, err := s.client.do(ctx, "SMEMBERS", s.indexKey())
+func (s *RedisStore) List(ctx context.Context, now time.Time) ([]models.Worker, error) {
+	result, err := s.client.do(ctx, "ZRANGEBYSCORE", s.leaseKey(),
+		"("+strconv.FormatInt(now.UnixMilli(), 10), "+inf")
 	if err != nil {
 		return nil, fmt.Errorf("list worker IDs from Redis: %w", err)
 	}
@@ -168,11 +182,10 @@ func (s *RedisStore) List(ctx context.Context) ([]models.Worker, error) {
 
 func (s *RedisStore) Delete(ctx context.Context, id string) error {
 	const script = `
-if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
-redis.call('DEL', KEYS[1])
-redis.call('SREM', KEYS[2], ARGV[1])
-return 1`
-	result, err := s.client.do(ctx, "EVAL", script, "2", s.workerKey(id), s.indexKey(), id)
+local deleted = redis.call('DEL', KEYS[1])
+redis.call('ZREM', KEYS[2], ARGV[1])
+return deleted`
+	result, err := s.client.do(ctx, "EVAL", script, "2", s.workerKey(id), s.leaseKey(), id)
 	if err != nil {
 		return fmt.Errorf("delete worker from Redis: %w", err)
 	}
@@ -186,15 +199,24 @@ return 1`
 	return nil
 }
 
+func (s *RedisStore) ReapExpired(ctx context.Context, now time.Time) error {
+	_, err := s.client.do(ctx, "ZREMRANGEBYSCORE", s.leaseKey(), "-inf",
+		strconv.FormatInt(now.UnixMilli(), 10))
+	if err != nil {
+		return fmt.Errorf("reap expired worker leases from Redis: %w", err)
+	}
+	return nil
+}
+
 // Close is a no-op because the dependency-free Redis client opens a bounded
 // connection per operation instead of retaining a connection pool.
 func (s *RedisStore) Close() error { return nil }
 
-func (s *RedisStore) indexKey() string { return s.prefix + ":workers" }
+func (s *RedisStore) leaseKey() string { return s.prefix + ":v2:leases" }
 
 func (s *RedisStore) workerKey(id string) string {
 	encodedID := base64.RawURLEncoding.EncodeToString([]byte(id))
-	return s.prefix + ":worker:" + encodedID
+	return s.prefix + ":v2:worker:" + encodedID
 }
 
 func decodeWorker(fields map[string]string) (models.Worker, error) {
@@ -211,6 +233,11 @@ func decodeWorker(fields map[string]string) (models.Worker, error) {
 		HealthStatus:    models.HealthStatus(fields["health_status"]),
 		WaitingRequests: waitingRequests, KVCacheUtilization: kvUtilization,
 	}
+	leaseExpiresAt, err := time.Parse(time.RFC3339Nano, fields["lease_expires_at"])
+	if err != nil {
+		return models.Worker{}, fmt.Errorf("decode lease_expires_at from Redis: %w", err)
+	}
+	worker.LeaseExpiresAt = leaseExpiresAt
 	if value := fields["last_heartbeat"]; value != "" {
 		lastHeartbeat, parseErr := time.Parse(time.RFC3339Nano, value)
 		if parseErr != nil {

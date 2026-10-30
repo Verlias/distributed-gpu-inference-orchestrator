@@ -21,12 +21,29 @@ var (
 
 // Registry coordinates validation, selection, summaries, and persistence.
 type Registry struct {
-	store store.WorkerStore
-	now   func() time.Time
+	store    store.WorkerStore
+	now      func() time.Time
+	leaseTTL time.Duration
 }
 
-func New(workerStore store.WorkerStore) *Registry {
-	return &Registry{store: workerStore, now: time.Now}
+const DefaultLeaseTTL = 10 * time.Second
+
+type Option func(*Registry)
+
+func WithLeaseTTL(ttl time.Duration) Option {
+	return func(registry *Registry) { registry.leaseTTL = ttl }
+}
+
+func WithClock(now func() time.Time) Option {
+	return func(registry *Registry) { registry.now = now }
+}
+
+func New(workerStore store.WorkerStore, options ...Option) *Registry {
+	registry := &Registry{store: workerStore, now: time.Now, leaseTTL: DefaultLeaseTTL}
+	for _, option := range options {
+		option(registry)
+	}
+	return registry
 }
 
 func (r *Registry) Ping(ctx context.Context) error {
@@ -38,11 +55,13 @@ func (r *Registry) Register(ctx context.Context, input models.WorkerRegistration
 	if err != nil {
 		return models.Worker{}, err
 	}
+	now := r.now().UTC()
 	return r.store.Create(ctx, models.Worker{
-		ID:           normalized.ID,
-		Endpoint:     normalized.Endpoint,
-		HealthStatus: models.HealthStatusUnknown,
-	})
+		ID:             normalized.ID,
+		Endpoint:       normalized.Endpoint,
+		HealthStatus:   models.HealthStatusUnknown,
+		LeaseExpiresAt: now.Add(r.leaseTTL),
+	}, r.leaseTTL)
 }
 
 func (r *Registry) Upsert(ctx context.Context, input models.WorkerRegistration) (models.Worker, error) {
@@ -50,7 +69,8 @@ func (r *Registry) Upsert(ctx context.Context, input models.WorkerRegistration) 
 	if err != nil {
 		return models.Worker{}, err
 	}
-	return r.store.UpsertIdentity(ctx, normalized)
+	now := r.now().UTC()
+	return r.store.UpsertIdentity(ctx, normalized, now.Add(r.leaseTTL), r.leaseTTL)
 }
 
 func (r *Registry) RecordHeartbeat(ctx context.Context, id string, heartbeat models.Heartbeat) (models.Worker, error) {
@@ -61,7 +81,8 @@ func (r *Registry) RecordHeartbeat(ctx context.Context, id string, heartbeat mod
 	if err := validateHeartbeat(heartbeat); err != nil {
 		return models.Worker{}, err
 	}
-	return r.store.UpdateHeartbeat(ctx, id, heartbeat, r.now().UTC())
+	now := r.now().UTC()
+	return r.store.UpdateHeartbeat(ctx, id, heartbeat, now, now.Add(r.leaseTTL), r.leaseTTL)
 }
 
 func (r *Registry) Get(ctx context.Context, id string) (models.Worker, error) {
@@ -69,11 +90,19 @@ func (r *Registry) Get(ctx context.Context, id string) (models.Worker, error) {
 	if id == "" {
 		return models.Worker{}, fmt.Errorf("%w: worker ID is required", ErrInvalidInput)
 	}
-	return r.store.Get(ctx, id)
+	worker, err := r.store.Get(ctx, id)
+	if err != nil {
+		return models.Worker{}, err
+	}
+	if !worker.LeaseExpiresAt.After(r.now().UTC()) {
+		_ = r.store.Delete(ctx, id)
+		return models.Worker{}, fmt.Errorf("%w: %s", store.ErrWorkerNotFound, id)
+	}
+	return worker, nil
 }
 
 func (r *Registry) List(ctx context.Context) ([]models.Worker, error) {
-	workers, err := r.store.List(ctx)
+	workers, err := r.store.List(ctx, r.now().UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +119,7 @@ func (r *Registry) Delete(ctx context.Context, id string) error {
 }
 
 func (r *Registry) Select(ctx context.Context) (models.Worker, error) {
-	workers, err := r.store.List(ctx)
+	workers, err := r.List(ctx)
 	if err != nil {
 		return models.Worker{}, err
 	}
@@ -111,7 +140,7 @@ func (r *Registry) Select(ctx context.Context) (models.Worker, error) {
 }
 
 func (r *Registry) Summary(ctx context.Context) (models.WorkerRegistrySummary, error) {
-	workers, err := r.store.List(ctx)
+	workers, err := r.List(ctx)
 	if err != nil {
 		return models.WorkerRegistrySummary{}, err
 	}
@@ -132,6 +161,10 @@ func (r *Registry) Summary(ctx context.Context) (models.WorkerRegistrySummary, e
 		result.AverageKVUtilization /= float64(result.TotalWorkers)
 	}
 	return result, nil
+}
+
+func (r *Registry) ReapExpired(ctx context.Context) error {
+	return r.store.ReapExpired(ctx, r.now().UTC())
 }
 
 func normalizeRegistration(input models.WorkerRegistration) (models.WorkerRegistration, error) {

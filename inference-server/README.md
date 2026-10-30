@@ -48,11 +48,11 @@ gateway can continue using the stable served name `orchestrator-model`.
 
 ## Connect the gateway
 
-The Go gateway defaults to a vLLM server on `http://localhost:8000`. Override
-these variables when the services run on different hosts or networks:
+The worker agent registers the vLLM endpoint in the registry. The gateway uses
+that registry endpoint dynamically rather than a fixed `VLLM_BASE_URL`:
 
 ```bash
-VLLM_BASE_URL=http://inference-server:8000
+REGISTRY_BASE_URL=http://registry:8081
 VLLM_MODEL=orchestrator-model
 ```
 

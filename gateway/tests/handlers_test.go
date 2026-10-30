@@ -10,6 +10,7 @@ import (
 
 	"github.com/Verlias/distributed-gpu-inference-orchestrator/internal/handlers"
 	"github.com/Verlias/distributed-gpu-inference-orchestrator/internal/models"
+	"github.com/Verlias/distributed-gpu-inference-orchestrator/internal/registry"
 )
 
 type fakeInferenceClient struct {
@@ -140,5 +141,19 @@ func TestInferenceHandlesClientFailure(t *testing.T) {
 
 	if response.Code != http.StatusBadGateway {
 		t.Fatalf("expected status %d, got %d", http.StatusBadGateway, response.Code)
+	}
+}
+
+func TestInferenceHandlesUnavailableRegistry(t *testing.T) {
+	client := &fakeInferenceClient{err: registry.ErrUnavailable}
+	request := httptest.NewRequest(
+		http.MethodPost, "/inference", strings.NewReader(`{"prompt":"hello"}`),
+	)
+	response := httptest.NewRecorder()
+
+	handlers.Inference(client)(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status %d, got %d", http.StatusServiceUnavailable, response.Code)
 	}
 }

@@ -19,6 +19,7 @@ type Worker struct {
 	Endpoint           string       `json:"endpoint"`
 	HealthStatus       HealthStatus `json:"health_status"`
 	LastHeartbeat      *time.Time   `json:"last_heartbeat,omitempty"`
+	LeaseExpiresAt     time.Time    `json:"lease_expires_at"`
 	WaitingRequests    int          `json:"waiting_requests"`
 	KVCacheUtilization float64      `json:"kv_cache_utilization"`
 }
