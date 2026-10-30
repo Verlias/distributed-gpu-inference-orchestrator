@@ -17,11 +17,12 @@ var (
 // WorkerStore persists worker identity and heartbeat telemetry.
 type WorkerStore interface {
 	Ping(context.Context) error
-	Create(context.Context, models.Worker) (models.Worker, error)
-	UpsertIdentity(context.Context, models.WorkerRegistration) (models.Worker, error)
-	UpdateHeartbeat(context.Context, string, models.Heartbeat, time.Time) (models.Worker, error)
+	Create(context.Context, models.Worker, time.Duration) (models.Worker, error)
+	UpsertIdentity(context.Context, models.WorkerRegistration, time.Time, time.Duration) (models.Worker, error)
+	UpdateHeartbeat(context.Context, string, models.Heartbeat, time.Time, time.Time, time.Duration) (models.Worker, error)
 	Get(context.Context, string) (models.Worker, error)
-	List(context.Context) ([]models.Worker, error)
+	List(context.Context, time.Time) ([]models.Worker, error)
 	Delete(context.Context, string) error
+	ReapExpired(context.Context, time.Time) error
 	Close() error
 }

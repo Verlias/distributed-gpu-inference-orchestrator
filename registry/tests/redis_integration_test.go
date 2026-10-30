@@ -26,25 +26,40 @@ func TestRedisStoreIntegration(t *testing.T) {
 	}
 
 	worker := models.Worker{ID: "worker-1", Endpoint: "http://worker:8000", HealthStatus: models.HealthStatusUnknown}
-	created, err := redisStore.Create(ctx, worker)
+	worker.LeaseExpiresAt = time.Now().UTC().Add(10 * time.Second)
+	created, err := redisStore.Create(ctx, worker, 10*time.Second)
 	if err != nil || created.ID != worker.ID {
 		t.Fatalf("create worker: worker=%#v err=%v", created, err)
 	}
-	if _, err := redisStore.Create(ctx, worker); !errors.Is(err, store.ErrWorkerExists) {
+	if _, err := redisStore.Create(ctx, worker, 10*time.Second); !errors.Is(err, store.ErrWorkerExists) {
 		t.Fatalf("expected duplicate error, got %v", err)
 	}
 
 	heartbeatAt := time.Now().UTC().Truncate(time.Microsecond)
 	updated, err := redisStore.UpdateHeartbeat(ctx, worker.ID, models.Heartbeat{
 		HealthStatus: models.HealthStatusHealthy, WaitingRequests: 2, KVCacheUtilization: 0.55,
-	}, heartbeatAt)
+	}, heartbeatAt, heartbeatAt.Add(10*time.Second), 10*time.Second)
 	if err != nil || updated.LastHeartbeat == nil || !updated.LastHeartbeat.Equal(heartbeatAt) || updated.WaitingRequests != 2 {
 		t.Fatalf("update heartbeat: worker=%#v err=%v", updated, err)
 	}
 
-	workers, err := redisStore.List(ctx)
+	workers, err := redisStore.List(ctx, time.Now().UTC())
 	if err != nil || len(workers) != 1 {
 		t.Fatalf("list workers: workers=%#v err=%v", workers, err)
+	}
+	expiring := models.Worker{
+		ID: "expiring-worker", Endpoint: "http://expiring:8000", HealthStatus: models.HealthStatusUnknown,
+		LeaseExpiresAt: time.Now().UTC().Add(100 * time.Millisecond),
+	}
+	if _, err := redisStore.Create(ctx, expiring, 100*time.Millisecond); err != nil {
+		t.Fatalf("create expiring worker: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if _, err := redisStore.Get(ctx, expiring.ID); !errors.Is(err, store.ErrWorkerNotFound) {
+		t.Fatalf("expected Redis TTL to remove worker, got %v", err)
+	}
+	if err := redisStore.ReapExpired(ctx, time.Now().UTC()); err != nil {
+		t.Fatalf("reap expired leases: %v", err)
 	}
 	if err := redisStore.Delete(ctx, worker.ID); err != nil {
 		t.Fatalf("delete worker: %v", err)

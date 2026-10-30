@@ -43,8 +43,39 @@ func NewClient(baseURL, model, apiKey string, httpClient *http.Client) (*Client,
 	}, nil
 }
 
+// NewDynamicClient creates a client whose target endpoint is supplied per request.
+func NewDynamicClient(model, apiKey string, httpClient *http.Client) (*Client, error) {
+	if strings.TrimSpace(model) == "" {
+		return nil, fmt.Errorf("vLLM model name cannot be empty")
+	}
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 2 * time.Minute}
+	}
+	return &Client{model: model, apiKey: apiKey, httpClient: httpClient}, nil
+}
+
 // Infer sends a prompt to vLLM and returns the first generated message.
 func (c *Client) Infer(ctx context.Context, input models.InferenceRequest) (models.InferenceResponse, error) {
+	if c.baseURL == nil {
+		return models.InferenceResponse{}, fmt.Errorf("vLLM endpoint was not configured")
+	}
+	return c.infer(ctx, c.baseURL, input)
+}
+
+// InferAt sends an inference request to a registry-selected vLLM endpoint.
+func (c *Client) InferAt(
+	ctx context.Context, baseURL string, input models.InferenceRequest,
+) (models.InferenceResponse, error) {
+	parsedURL, err := url.Parse(baseURL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+		return models.InferenceResponse{}, fmt.Errorf("invalid vLLM base URL %q", baseURL)
+	}
+	return c.infer(ctx, parsedURL, input)
+}
+
+func (c *Client) infer(
+	ctx context.Context, baseURL *url.URL, input models.InferenceRequest,
+) (models.InferenceResponse, error) {
 	payload, err := json.Marshal(models.VLLMChatCompletionRequest{
 		Model:       c.model,
 		Messages:    []models.VLLMChatMessage{{Role: "user", Content: input.Prompt}},
@@ -55,7 +86,7 @@ func (c *Client) Infer(ctx context.Context, input models.InferenceRequest) (mode
 		return models.InferenceResponse{}, fmt.Errorf("encode vLLM request: %w", err)
 	}
 
-	endpoint := *c.baseURL
+	endpoint := *baseURL
 	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/v1/chat/completions"
 	request, err := http.NewRequestWithContext(
 		ctx, http.MethodPost, endpoint.String(), bytes.NewReader(payload),

@@ -50,10 +50,16 @@ curl -X POST http://localhost:8081/workers/worker-1/heartbeat \
 | `REDIS_PASSWORD` | empty |
 | `REDIS_DB` | `0` |
 | `REDIS_KEY_PREFIX` | `gpu-orchestrator` |
+| `WORKER_LEASE_TTL` | `10s` |
+
+Registration and every heartbeat renew the worker's Redis lease. An unhealthy
+heartbeat keeps the record for visibility but excludes it from selection. If
+the agent stops reporting, Redis expires the worker and the API no longer lists
+or selects it.
 
 Run unit tests with `go test -race ./...`. To include the real Redis integration
 test, start Redis and run:
 
 ```bash
-REDIS_INTEGRATION_ADDR=localhost:6379 go test ./store -run Integration
+REDIS_INTEGRATION_ADDR=localhost:6379 go test ./tests -run RedisStoreIntegration
 ```

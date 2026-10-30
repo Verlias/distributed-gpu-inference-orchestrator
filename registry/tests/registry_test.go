@@ -75,6 +75,65 @@ func TestRegistryValidatesRequests(t *testing.T) {
 	}
 }
 
+func TestWorkerLeaseRenewsAndExpires(t *testing.T) {
+	now := time.Date(2026, time.October, 30, 12, 0, 0, 0, time.UTC)
+	workerStore := newFakeStore()
+	registry := service.New(workerStore, service.WithLeaseTTL(10*time.Second), service.WithClock(func() time.Time {
+		return now
+	}))
+	ctx := context.Background()
+
+	worker, err := registry.Register(ctx, models.WorkerRegistration{ID: "worker-1", Endpoint: "http://worker:8000"})
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	if !worker.LeaseExpiresAt.Equal(now.Add(10 * time.Second)) {
+		t.Fatalf("unexpected initial lease: %v", worker.LeaseExpiresAt)
+	}
+
+	now = now.Add(2 * time.Second)
+	worker, err = registry.RecordHeartbeat(ctx, worker.ID, models.Heartbeat{HealthStatus: models.HealthStatusHealthy})
+	if err != nil {
+		t.Fatalf("record heartbeat: %v", err)
+	}
+	if !worker.LeaseExpiresAt.Equal(now.Add(10 * time.Second)) {
+		t.Fatalf("heartbeat did not renew lease: %v", worker.LeaseExpiresAt)
+	}
+
+	now = now.Add(11 * time.Second)
+	if _, err := registry.Get(ctx, worker.ID); !errors.Is(err, store.ErrWorkerNotFound) {
+		t.Fatalf("expected expired worker to be missing, got %v", err)
+	}
+	if _, err := registry.Select(ctx); !errors.Is(err, service.ErrNoAvailableWorkers) {
+		t.Fatalf("expected no available workers, got %v", err)
+	}
+}
+
+func TestUnknownAndUnhealthyWorkersRemainVisibleButAreNotSelected(t *testing.T) {
+	registry := service.New(newFakeStore())
+	ctx := context.Background()
+	if _, err := registry.Register(ctx, models.WorkerRegistration{
+		ID: "worker-1", Endpoint: "http://worker:8000",
+	}); err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+	if _, err := registry.Select(ctx); !errors.Is(err, service.ErrNoAvailableWorkers) {
+		t.Fatalf("expected unknown worker to be excluded, got %v", err)
+	}
+	if _, err := registry.RecordHeartbeat(ctx, "worker-1", models.Heartbeat{
+		HealthStatus: models.HealthStatusUnhealthy,
+	}); err != nil {
+		t.Fatalf("record unhealthy heartbeat: %v", err)
+	}
+	workers, err := registry.List(ctx)
+	if err != nil || len(workers) != 1 || workers[0].HealthStatus != models.HealthStatusUnhealthy {
+		t.Fatalf("expected visible unhealthy worker, workers=%#v err=%v", workers, err)
+	}
+	if _, err := registry.Select(ctx); !errors.Is(err, service.ErrNoAvailableWorkers) {
+		t.Fatalf("expected unhealthy worker to be excluded, got %v", err)
+	}
+}
+
 func TestRegistryAPIWorkerLifecycle(t *testing.T) {
 	handler := api.NewHandler(service.New(newFakeStore())).Routes()
 
@@ -179,7 +238,7 @@ func newFakeStore() *fakeStore {
 func (s *fakeStore) Ping(context.Context) error { return nil }
 func (s *fakeStore) Close() error               { return nil }
 
-func (s *fakeStore) Create(_ context.Context, worker models.Worker) (models.Worker, error) {
+func (s *fakeStore) Create(_ context.Context, worker models.Worker, _ time.Duration) (models.Worker, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.workers[worker.ID]; exists {
@@ -189,7 +248,9 @@ func (s *fakeStore) Create(_ context.Context, worker models.Worker) (models.Work
 	return worker, nil
 }
 
-func (s *fakeStore) UpsertIdentity(_ context.Context, input models.WorkerRegistration) (models.Worker, error) {
+func (s *fakeStore) UpsertIdentity(
+	_ context.Context, input models.WorkerRegistration, leaseExpiresAt time.Time, _ time.Duration,
+) (models.Worker, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	worker, exists := s.workers[input.ID]
@@ -197,11 +258,14 @@ func (s *fakeStore) UpsertIdentity(_ context.Context, input models.WorkerRegistr
 		worker = models.Worker{ID: input.ID, HealthStatus: models.HealthStatusUnknown}
 	}
 	worker.Endpoint = input.Endpoint
+	worker.LeaseExpiresAt = leaseExpiresAt
 	s.workers[input.ID] = worker
 	return worker, nil
 }
 
-func (s *fakeStore) UpdateHeartbeat(_ context.Context, id string, heartbeat models.Heartbeat, at time.Time) (models.Worker, error) {
+func (s *fakeStore) UpdateHeartbeat(
+	_ context.Context, id string, heartbeat models.Heartbeat, at, leaseExpiresAt time.Time, _ time.Duration,
+) (models.Worker, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	worker, exists := s.workers[id]
@@ -210,6 +274,7 @@ func (s *fakeStore) UpdateHeartbeat(_ context.Context, id string, heartbeat mode
 	}
 	worker.HealthStatus = heartbeat.HealthStatus
 	worker.LastHeartbeat = &at
+	worker.LeaseExpiresAt = leaseExpiresAt
 	worker.WaitingRequests = heartbeat.WaitingRequests
 	worker.KVCacheUtilization = heartbeat.KVCacheUtilization
 	s.workers[id] = worker
@@ -226,15 +291,28 @@ func (s *fakeStore) Get(_ context.Context, id string) (models.Worker, error) {
 	return worker, nil
 }
 
-func (s *fakeStore) List(context.Context) ([]models.Worker, error) {
+func (s *fakeStore) List(_ context.Context, now time.Time) ([]models.Worker, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	workers := make([]models.Worker, 0, len(s.workers))
 	for _, worker := range s.workers {
-		workers = append(workers, worker)
+		if worker.LeaseExpiresAt.After(now) {
+			workers = append(workers, worker)
+		}
 	}
 	sort.Slice(workers, func(i, j int) bool { return workers[i].ID < workers[j].ID })
 	return workers, nil
+}
+
+func (s *fakeStore) ReapExpired(_ context.Context, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, worker := range s.workers {
+		if !worker.LeaseExpiresAt.After(now) {
+			delete(s.workers, id)
+		}
+	}
+	return nil
 }
 
 func (s *fakeStore) Delete(_ context.Context, id string) error {

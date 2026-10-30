@@ -1,0 +1,100 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  registry:
+    build: ./registry
+    environment:
+      REGISTRY_LISTEN_ADDR: ":8081"
+      REDIS_ADDR: "redis:6379"
+      REDIS_KEY_PREFIX: "gpu-orchestrator"
+      WORKER_LEASE_TTL: "10s"
+    ports:
+      - "8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8081/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  inference-server:
+    image: vllm/vllm-openai-cpu:v0.31.0
+    command:
+      - --model
+      - ${MODEL_ID:-Qwen/Qwen3-0.6B}
+      - --served-model-name
+      - ${SERVED_MODEL_NAME:-orchestrator-model}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --dtype
+      - ${VLLM_DTYPE:-bfloat16}
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-4096}
+      - --max-num-seqs
+      - ${VLLM_MAX_NUM_SEQS:-4}
+      - --tensor-parallel-size
+      - ${VLLM_TENSOR_PARALLEL_SIZE:-1}
+    environment:
+      VLLM_CPU_KVCACHE_SPACE: ${VLLM_CPU_KVCACHE_SPACE:-2}
+      HF_TOKEN: ${HF_TOKEN:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - huggingface-cache:/root/.cache/huggingface
+    shm_size: "2gb"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 120s
+    init: true
+
+  worker-agent:
+    build: ./agent
+    environment:
+      WORKER_ID: "worker-1"
+      VLLM_ENDPOINT: "http://inference-server:8000"
+      REGISTRY_BASE_URL: "http://registry:8081"
+      HEALTH_POLL_INTERVAL: "2s"
+      HEALTH_REQUEST_TIMEOUT: "1s"
+    depends_on:
+      registry:
+        condition: service_healthy
+      inference-server:
+        condition: service_healthy
+    init: true
+
+  gateway:
+    build: ./gateway
+    environment:
+      REGISTRY_BASE_URL: "http://registry:8081"
+      VLLM_MODEL: ${SERVED_MODEL_NAME:-orchestrator-model}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+    ports:
+      - "8090:8090"
+    depends_on:
+      registry:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8090/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+volumes:
+  redis-data:
+  huggingface-cache:

@@ -2,10 +2,12 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 
 	"github.com/Verlias/distributed-gpu-inference-orchestrator/internal/models"
+	"github.com/Verlias/distributed-gpu-inference-orchestrator/internal/registry"
 )
 
 type inferenceClient interface {
@@ -33,6 +35,11 @@ func Inference(client inferenceClient) http.HandlerFunc {
 
 		result, err := client.Infer(r.Context(), input)
 		if err != nil {
+			if errors.Is(err, registry.ErrUnavailable) {
+				log.Printf("worker selection failed: %v", err)
+				http.Error(w, "no inference worker available", http.StatusServiceUnavailable)
+				return
+			}
 			log.Printf("vLLM inference failed: %v", err)
 			http.Error(w, "inference service unavailable", http.StatusBadGateway)
 			return
