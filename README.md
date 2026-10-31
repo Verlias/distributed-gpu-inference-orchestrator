@@ -1,5 +1,7 @@
 # Distributed GPU inference orchestrator
 
+Project work in progress..
+
 The connected prototype contains:
 
 - `gateway`: selects a live worker from the registry and forwards inference.
